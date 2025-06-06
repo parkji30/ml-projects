@@ -10,4 +10,5 @@ dependencies = []
 members = [
     "gpt2-jax",
     "optimization",
+    "ml",
 ]
