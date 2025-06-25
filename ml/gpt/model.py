@@ -5,72 +5,94 @@ import math
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1):
+    def __init__(self, d_model, n_heads, dropout=0.1, use_flash_attention=True):
         super().__init__()
         assert d_model % n_heads == 0
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        self.use_flash_attention = use_flash_attention
 
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
-        self.out = nn.Linear(d_model, d_model)
+        # Fused QKV projection for efficiency
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
 
         self.dropout = nn.Dropout(dropout)
+        self.dropout_p = dropout
 
     def forward(self, x, mask=None):
         batch_size, seq_len, d_model = x.size()
 
-        # Linear transformations and split into heads
-        Q = (
-            self.q_linear(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        K = (
-            self.k_linear(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        V = (
-            self.v_linear(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
+        # Fused QKV computation
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape for multi-head attention: (batch, seq_len, n_heads, d_k)
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_k)
+        k = k.view(batch_size, seq_len, self.n_heads, self.d_k)
+        v = v.view(batch_size, seq_len, self.n_heads, self.d_k)
 
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if self.use_flash_attention:
+            # Use PyTorch's built-in Flash Attention (PyTorch 2.0+)
+            # scaled_dot_product_attention automatically uses Flash Attention when available
+            context = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,  # We use causal mask built into the function
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=True  # This enables causal masking automatically
+            )
+            # Output shape: (batch, seq_len, n_heads, d_k)
+            # Use reshape instead of view to handle non-contiguous tensors
+            context = context.reshape(batch_size, seq_len, d_model)
+        else:
+            # Standard scaled dot-product attention with manual optimizations
+            # Reshape to (batch, n_heads, seq_len, d_k) for manual attention
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            context = self._standard_attention(q, k, v, mask)
+
+        output = self.out(context)
+        return output
+
+    def _standard_attention(self, q, k, v, mask=None):
+        batch_size, n_heads, seq_len, d_k = q.size()
+        
+        # More memory-efficient attention computation
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
 
         # Apply causal mask for autoregressive generation
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
+        else:
+            # Create causal mask if not provided
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool))
+            scores = scores.masked_fill(~causal_mask, -1e9)
 
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
 
         # Apply attention to values
-        context = torch.matmul(attention_weights, V)
+        context = torch.matmul(attention_weights, v)
 
-        # Concatenate heads and put through final linear layer
-        context = (
-            context.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-        )
-        output = self.out(context)
-
-        return output
+        # Concatenate heads
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return context
 
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        # Use SwiGLU activation for better performance
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_ff, d_model, bias=False) 
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.linear2(self.dropout(F.gelu(self.linear1(x))))
+        # SwiGLU: swish(xW1) ⊙ (xW3) then linear projection
+        return self.w2(self.dropout(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -83,11 +105,10 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
-        # Self-attention with residual connection
+        # Pre-norm architecture for better training stability
         attn_output = self.attention(self.norm1(x), mask)
         x = x + self.dropout(attn_output)
 
-        # Feed-forward with residual connection
         ff_output = self.feed_forward(self.norm2(x))
         x = x + self.dropout(ff_output)
 
@@ -110,7 +131,7 @@ class GPTDecoder(nn.Module):
         self.d_model = d_model
         self.max_seq_len = max_seq_len
 
-        # Embeddings
+        # Embeddings with weight tying
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
 
@@ -119,9 +140,12 @@ class GPTDecoder(nn.Module):
             [TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
         )
 
-        # Final layer norm and output projection
+        # Final layer norm
         self.layer_norm = nn.LayerNorm(d_model)
-        self.output_projection = nn.Linear(d_model, vocab_size)
+        
+        # Weight tying: share weights between input embedding and output projection
+        self.output_projection = nn.Linear(d_model, vocab_size, bias=False)
+        self.output_projection.weight = self.token_embedding.weight
 
         self.dropout = nn.Dropout(dropout)
 
@@ -148,23 +172,16 @@ class GPTDecoder(nn.Module):
         batch_size, seq_len = context.size()
 
         # Create position indices
-        positions = (
-            torch.arange(seq_len, device=context.device)
-            .unsqueeze(0)
-            .expand(batch_size, seq_len)
-        )
+        positions = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, seq_len)
 
         # Embeddings
         token_emb = self.token_embedding(context)
         pos_emb = self.position_embedding(positions)
         x = self.dropout(token_emb + pos_emb)
 
-        # Create causal mask
-        mask = self.create_causal_mask(seq_len).to(context.device)
-
-        # Pass through transformer blocks
+        # Pass through transformer blocks (mask handled internally now)
         for transformer_block in self.transformer_blocks:
-            x = transformer_block(x, mask)
+            x = transformer_block(x)
 
         # Final layer norm and output projection
         x = self.layer_norm(x)
@@ -173,15 +190,24 @@ class GPTDecoder(nn.Module):
         if response is None:
             return logits
         else:
-            # Calculate loss
+            # Calculate loss with label smoothing for better generalization
             B, T, C = logits.shape
-            logits = logits.reshape(B * T, C)
-            response = response.reshape(B * T)
-            loss = F.cross_entropy(logits, response)
+            logits_flat = logits.reshape(B * T, C)
+            response_flat = response.reshape(B * T)
+            
+            # Label smoothing
+            smoothing = 0.1
+            confidence = 1.0 - smoothing
+            log_probs = F.log_softmax(logits_flat, dim=-1)
+            nll_loss = F.nll_loss(log_probs, response_flat, reduction='mean')
+            smooth_loss = -log_probs.mean(dim=-1).mean()
+            loss = confidence * nll_loss + smoothing * smooth_loss
+            
             return logits, loss
 
-    def generate(self, context, max_new_tokens, temperature=1.0, top_k=None):
-        """Generate new tokens autoregressively"""
+    @torch.inference_mode()
+    def generate(self, context, max_new_tokens, temperature=1.0, top_k=None, top_p=0.9):
+        """Generate new tokens autoregressively with top-p sampling"""
         self.eval()
 
         for _ in range(max_new_tokens):
@@ -193,23 +219,35 @@ class GPTDecoder(nn.Module):
             )
 
             # Forward pass
-            with torch.no_grad():
-                logits = self(context_cond)
-                # Get logits for the last token
-                logits = logits[:, -1, :] / temperature
+            logits = self(context_cond)
+            # Get logits for the last token
+            logits = logits[:, -1, :] / temperature
 
-                # Apply top-k filtering if specified
-                if top_k is not None:
-                    v, _ = torch.topk(logits, top_k)
-                    logits[logits < v[:, [-1]]] = -float("Inf")
+            # Apply top-k filtering if specified
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float("Inf")
 
-                # Apply softmax to get probabilities
-                probs = F.softmax(logits, dim=-1)
+            # Apply top-p (nucleus) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float("Inf")
 
-                # Sample next token
-                next_token = torch.multinomial(probs, num_samples=1)
+            # Apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1)
 
-                # Append to context
-                context = torch.cat((context, next_token), dim=1)
+            # Sample next token
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Append to context
+            context = torch.cat((context, next_token), dim=1)
 
         return context

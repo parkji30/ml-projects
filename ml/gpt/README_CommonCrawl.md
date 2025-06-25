@@ -92,10 +92,6 @@ The future of artificial intelligence depends on our ability to create systems t
 
 ## Performance Expectations
 
-On Tesla T4:
-- **Character-level**: ~2-3 seconds/iteration
-- **BPE**: ~4-5 seconds/iteration  
-
 Training for 5000 iterations should give you a reasonable model that can generate coherent English text instead of just Shakespeare-style language.
 
 ## Troubleshooting
