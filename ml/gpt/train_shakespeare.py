@@ -5,6 +5,36 @@ import os
 from torch import nn
 from model import GPTDecoder
 from tqdm import tqdm
+# from torch.amp import autocast, GradScaler  # Disabled mixed precision
+import torch._dynamo
+import numpy as np
+
+
+class OptimizedDataLoader:
+    """Optimized data loader for faster batch generation"""
+    def __init__(self, data, sequence_length, batch_size, device):
+        self.data = torch.tensor(data, dtype=torch.long, device=device)
+        self.sequence_length = sequence_length
+        self.batch_size = batch_size
+        self.device = device
+        self.data_len = len(data)
+        
+        # Pre-compute valid starting indices
+        self.valid_indices = torch.arange(self.data_len - sequence_length, device=device)
+        
+    def get_batch(self):
+        # Sample random starting indices
+        idx = torch.randint(len(self.valid_indices), (self.batch_size,), device=self.device)
+        start_indices = self.valid_indices[idx]
+        
+        # Vectorized batch creation
+        indices = start_indices.unsqueeze(1) + torch.arange(self.sequence_length, device=self.device)
+        target_indices = start_indices.unsqueeze(1) + torch.arange(1, self.sequence_length + 1, device=self.device)
+        
+        context = self.data[indices]
+        targets = self.data[target_indices]
+        
+        return context, targets
 
 
 def create_data_mappers(input_file_path):
@@ -65,9 +95,15 @@ if __name__ == "__main__":
     train_enc = encode(train)
     test_enc = encode(test)
 
-    batch_size = 65
-    seq_length = 128
+    batch_size = 256  # A100 optimized with bfloat16
+    seq_length = 512  # Longer sequences for better context
     iterations = 10000
+    gradient_accumulation_steps = 2  # Effective batch size = 256 * 2 = 512
+    
+    # Initialize optimized data loaders
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_loader = OptimizedDataLoader(train_enc, seq_length, batch_size, device)
+    test_loader = OptimizedDataLoader(test_enc, seq_length, batch_size, device)
 
     model = GPTDecoder(
         vocab_size=len(stoi),
@@ -76,39 +112,64 @@ if __name__ == "__main__":
         n_layers=40,
         d_ff=2048,
         max_seq_len=seq_length,
-    ).to("cuda").to(torch.bfloat16)
+    ).to("cuda").to(torch.bfloat16)  # Native bfloat16 for A100
 
-    optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # Compile model for faster execution (PyTorch 2.0+)
+    model = torch.compile(model)
+
+    # Mixed precision disabled
+    # scaler = GradScaler()
+    
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=iterations)
 
     model_path = "gpt2_model.pth"
 
     if os.path.exists(model_path):
-        state_dict = torch.load(model_path, weights_only=True)
-        model.load_state_dict(state_dict['model_state_dict'])
-        optim.load_state_dict(state_dict['optim_state_dict'])
+        checkpoint = torch.load(model_path, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optim.load_state_dict(checkpoint['optim_state_dict'])
+                    # Mixed precision disabled
+            # if 'scaler_state_dict' in checkpoint:
+            #     scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print("\nSucessfully loaded torch model.\n")
 
     if not args.eval:
         pbar = tqdm(range(iterations), ncols=100, desc="Training")
         for i in pbar:
-            context_tensor, response_tensor = create_batch_data(
-                train_enc, seq_length, batch_size
-            )
-            logits, loss = model(context_tensor, response_tensor)
-
-            # Set gradient to 0
-            optim.zero_grad()
-
-            # Calculate gradients
-            loss.backward()
-
-            # Update parameters
+            # Gradient accumulation loop
+            total_loss = 0
+            for micro_step in range(gradient_accumulation_steps):
+                context_tensor, response_tensor = train_loader.get_batch()
+                
+                # bfloat16 forward pass (optimized for A100)
+                logits, loss = model(context_tensor, response_tensor)
+                loss = loss / gradient_accumulation_steps  # Scale loss
+                
+                total_loss += loss.item()
+                
+                # Standard backward pass
+                loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Optimizer step
             optim.step()
+            optim.zero_grad()
+            scheduler.step()
 
             # Update progress bar with loss
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            pbar.set_postfix({
+                "Loss": f"{total_loss:.4f}", 
+                "LR": f"{scheduler.get_last_lr()[0]:.2e}"
+            })
 
-            if i % 100 ==0:
+            if i % 100 == 0:
                 with open("evals.txt", "a") as f:
                     f.write('\n')
                     f.write(f"\nEval at Iteration {i}\n")
@@ -128,6 +189,8 @@ if __name__ == "__main__":
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "optim_state_dict": optim.state_dict(),
+                    # "scaler_state_dict": scaler.state_dict(),  # Mixed precision disabled
+                    "scheduler_state_dict": scheduler.state_dict(),
                 }, model_path)
                 print("Model saved as 'gpt2_model.pth'")
     else:

@@ -9,6 +9,8 @@ import argparse
 from datasets import load_dataset
 from tqdm import tqdm
 
+DIRECTORY = f'/data/'
+
 def download_c4_subset(output_file="common_crawl_subset.txt", num_examples=100000, split="train"):
     """
     Download a subset of the C4 dataset (cleaned Common Crawl).

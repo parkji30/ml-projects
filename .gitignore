@@ -1,3 +1,27 @@
 .venv
 .vscode
 *.txt
+
+# Model files and weights
+*.pth
+*.pt
+*.pkl
+*.ckpt
+*.h5
+*.pb
+*.safetensors
+*.bin
+*.model
+*.weights
+
+# Tensor and array files
+*.npz
+*.npy
+
+# Training artifacts
+*.log
+*.tensorboard
+checkpoints/
+logs/
+runs/
+wandb/
