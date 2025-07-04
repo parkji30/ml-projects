@@ -16,7 +16,16 @@ from torch.utils.data import DataLoader
 from dataset import DynamicTextDataset, create_bpe_tokenizer
 from plot import create_loss_plotter
 from model import GPTDecoder, calculate_gpt_params_swiglu
-from ml.utils import setup_memory_management, print_memory_stats, check_memory_requirements
+
+# Import from parent directory
+try:
+    from ..utils import setup_memory_management, print_memory_stats, check_memory_requirements
+except ImportError:
+    # Fallback for when script is run directly
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils import setup_memory_management, print_memory_stats, check_memory_requirements
 
 
 def main():
@@ -53,16 +62,16 @@ def main():
         gradient_accumulation_steps = 32  # Higher accumulation to maintain effective batch size
         print("🛡️  Safe mode enabled - using conservative memory settings")
     else:
-        batch_size = 24  # Reduced from 48
+        batch_size = 48
         seq_length = 1024  # Keep long sequences for better context
         iterations = 10000
-        gradient_accumulation_steps = 16  # Effective batch size = 384 (reduced from 768)
+        gradient_accumulation_steps = 16  # Effective batch size = 768
     
     # Model size configuration - slightly smaller for better memory efficiency
-    d_model = 768  # Reduced from 1024
-    n_layers = 20  # Reduced from 24
-    n_heads = 12   # Reduced from 16
-    d_ff = 2048    # Reduced from 3072
+    d_model = 1024  # Reduced from 1024
+    n_layers = 24  # Reduced from 24
+    n_heads = 16   # Reduced from 16
+    d_ff = 3072    # Reduced from 3072
     learning_rate = 6e-4
 
     # Get vocabulary size first
@@ -89,7 +98,7 @@ def main():
     print(f"   Data directory contents: {os.listdir(args.data_dir) if os.path.exists(args.data_dir) else 'Directory does not exist'}")
     
     # Check if fineweb.txt file exists
-    text_file = os.path.join(args.data_dir, 'fineweb.txt')
+    text_file = os.path.join(args.data_dir, 'fineweb_tokenizer_ready.txt')
     
     print(f"   Checking for text file...")
     print(f"   - fineweb.txt path: {text_file}")
@@ -208,23 +217,9 @@ def main():
         print("   - Testing DataLoader iterator creation...")
         train_iter = iter(train_loader)
         print("   ✅ DataLoader iterator created successfully")
-        
-        # Test with timeout to prevent hanging
-        import signal
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError("DataLoader test timed out - this usually indicates dataset access issues")
-        
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(10)  # 10 second timeout (increased from 5)
-        
-        try:
-            print("   - Testing first batch retrieval...")
-            test_batch = next(train_iter)
-            print(f"✅ DataLoader test successful! Batch shape: {test_batch[0].shape}")
-        finally:
-            signal.alarm(0)  # Cancel the alarm
-            
+        print("   - Testing first batch retrieval...")
+        test_batch = next(train_iter)
+        print(f"✅ DataLoader test successful! Batch shape: {test_batch[0].shape}")    
         print_memory_stats("After DataLoader test")
     except Exception as e:
         print(f"❌ DataLoader test failed: {e}")
@@ -268,7 +263,9 @@ def main():
         print("🔥 Compiling model...")
         print_memory_stats("Before compilation")
         try:
-            model = torch.compile(model, mode='reduce-overhead')
+            # Use 'default' mode instead of 'reduce-overhead' to avoid CUDA graph issues
+            # 'reduce-overhead' enables CUDA graphs which have strict tensor reuse constraints
+            model = torch.compile(model, mode='default')
             print("✅ Model compiled successfully!")
             print_memory_stats("After compilation")
         except Exception as e:
@@ -327,6 +324,9 @@ def main():
                 context_tensor = context_tensor.to(device, non_blocking=True)
                 response_tensor = response_tensor.to(device, non_blocking=True)
                 
+                # Mark step boundary for CUDAGraphs to prevent tensor overwriting
+                torch.compiler.cudagraph_mark_step_begin()
+                
                 # Forward pass with memory efficiency
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     logits, loss = model(context_tensor, response_tensor)
@@ -335,8 +335,8 @@ def main():
                 total_loss += loss.item()
                 loss.backward()
                 
-                # Clear intermediate tensors
-                del context_tensor, response_tensor, logits
+                # Don't explicitly delete tensors when using torch.compile
+                # PyTorch will handle memory management automatically
             
             # Gradient clipping and optimization
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -426,8 +426,7 @@ def main():
                                 _, eval_loss = model(eval_context, eval_response)
                             eval_losses.append(eval_loss.item())
                             
-                            # Clean up evaluation tensors
-                            del eval_context, eval_response
+                            # Let PyTorch handle tensor cleanup automatically
                             
                         except StopIteration:
                             break

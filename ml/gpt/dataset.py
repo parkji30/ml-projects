@@ -8,7 +8,7 @@ try:
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
-    
+
 class DynamicTextDataset(Dataset):
     """
     Dynamic Dataset that reads data from disk without loading everything into memory.
@@ -109,5 +109,5 @@ def create_bpe_tokenizer():
         tokenizer = tiktoken.get_encoding("gpt2")
         return tokenizer
     except Exception as e:
-        print(f"Error loading tiktoken: {e}, falling back to character-level")
+        print(f"Error loading tiktoken: {e}")
         return None
