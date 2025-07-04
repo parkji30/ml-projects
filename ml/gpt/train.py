@@ -7,7 +7,7 @@ Uses FineWeb dataset (high-quality filtered web text).
 
 import torch
 import os
-from model import GPTDecoder
+
 from tqdm import tqdm
 import torch._dynamo
 import numpy as np
@@ -15,7 +15,9 @@ from torch.utils.data import DataLoader
 
 from dataset import DynamicTextDataset, create_bpe_tokenizer
 from plot import create_loss_plotter
+from model import GPTDecoder, calculate_gpt_params_swiglu
 from ml.utils import setup_memory_management, print_memory_stats, check_memory_requirements
+
 
 def main():
     import argparse
@@ -33,6 +35,7 @@ def main():
     args = parser.parse_args()
     
     # Setup optimized memory management
+
     setup_memory_management()
     print_memory_stats("Initial")
     
@@ -231,7 +234,7 @@ def main():
         raise
 
     # Calculate model parameters
-    params = calculate_gpt_params(
+    params = calculate_gpt_params_swiglu(
         vocab_size=vocab_size,
         d_model=d_model,
         n_heads=n_heads,

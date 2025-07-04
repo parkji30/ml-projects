@@ -1,5 +1,15 @@
 import torch
 
+def block_print(func):
+    """Decorator that wraps function output with dashed lines"""
+    def wrapper(*args, **kwargs):
+        print('-' * 50)
+        result = func(*args, **kwargs)
+        print('-' * 50)
+        return result
+    return wrapper
+
+@block_print
 def setup_memory_management():
     """Setup optimized memory management for A100"""
     if torch.cuda.is_available():
@@ -30,6 +40,7 @@ def setup_memory_management():
         print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         print(f"   Memory fraction set to 95%")
 
+@block_print
 def check_memory_requirements(batch_size, seq_length, d_model, n_layers, vocab_size):
     """Estimate memory requirements and suggest adjustments"""
     if not torch.cuda.is_available():
@@ -75,6 +86,7 @@ def check_memory_requirements(batch_size, seq_length, d_model, n_layers, vocab_s
     
     return batch_size, seq_length
 
+@block_print
 def print_memory_stats(stage):
     """Print current GPU memory usage"""
     if torch.cuda.is_available():
