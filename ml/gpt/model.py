@@ -135,6 +135,8 @@ class GPTDecoder(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
 
+        self.emebedding_drop = nn.Dropout(p=dropout)
+
         # Transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
@@ -178,6 +180,7 @@ class GPTDecoder(nn.Module):
         token_emb = self.token_embedding(context)
         pos_emb = self.position_embedding(positions)
         x = self.dropout(token_emb + pos_emb)
+        x = self.emebedding_drop(x)
 
         # Pass through transformer blocks (mask handled internally now)
         for transformer_block in self.transformer_blocks:
