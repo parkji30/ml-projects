@@ -135,6 +135,8 @@ class GPTDecoder(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
 
+        self.emebedding_drop = nn.Dropout(p=dropout)
+
         # Transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
@@ -178,6 +180,7 @@ class GPTDecoder(nn.Module):
         token_emb = self.token_embedding(context)
         pos_emb = self.position_embedding(positions)
         x = self.dropout(token_emb + pos_emb)
+        x = self.emebedding_drop(x)
 
         # Pass through transformer blocks (mask handled internally now)
         for transformer_block in self.transformer_blocks:
@@ -251,3 +254,91 @@ class GPTDecoder(nn.Module):
             context = torch.cat((context, next_token), dim=1)
 
         return context
+
+
+def calculate_gpt_params(vocab_size, d_model, n_layers, n_heads, d_ff, max_seq_len):
+    """Calculate total parameters for GPT model."""
+    
+    # Embeddings
+    token_embedding = vocab_size * d_model
+    position_embedding = max_seq_len * d_model
+    embedding_params = token_embedding + position_embedding
+    
+    # Per transformer block parameters
+    # Attention: Q, K, V, Out linear layers (each d_model x d_model + bias)
+    attention_params = 4 * (d_model * d_model + d_model)
+    # Feed forward: two linear layers
+    ff_params = (d_model * d_ff + d_ff) + (d_ff * d_model + d_model)
+    # Layer norms: 2 per block, each with weight + bias
+    layernorm_params = 2 * (d_model + d_model)
+    
+    per_block_params = attention_params + ff_params + layernorm_params
+    total_transformer_params = per_block_params * n_layers
+    
+    # Final components
+    final_layernorm = d_model + d_model
+    output_projection = d_model * vocab_size + vocab_size
+    final_params = final_layernorm + output_projection
+    
+    total_params = embedding_params + total_transformer_params + final_params
+    
+    return {
+        'embedding_params': embedding_params,
+        'transformer_params': total_transformer_params,
+        'final_params': final_params,
+        'total_params': total_params,
+        'per_block_params': per_block_params
+    }
+
+
+def calculate_gpt_params_swiglu(vocab_size, d_model, n_layers, n_heads, d_ff, max_seq_len):
+    """Calculate total parameters for GPT model with SwiGLU architecture (used in actual model)."""
+    
+    # Embeddings
+    token_embedding = vocab_size * d_model
+    position_embedding = max_seq_len * d_model
+    embedding_params = token_embedding + position_embedding
+    
+    # Per transformer block parameters
+    # Attention: QKV fused projection (3 * d_model * d_model, no bias) + output projection (d_model * d_model, no bias)
+    attention_params = 3 * d_model * d_model + d_model * d_model  # QKV + out projection, no bias
+    
+    # Feed forward with SwiGLU: 3 linear layers (w1, w2, w3), all without bias
+    # w1: d_model -> d_ff, w2: d_ff -> d_model, w3: d_model -> d_ff
+    ff_params = (d_model * d_ff) + (d_ff * d_model) + (d_model * d_ff)
+    
+    # Layer norms: 2 per block, each with weight + bias (d_model parameters each)
+    layernorm_params = 2 * (d_model + d_model)  # weight + bias for each norm
+    
+    per_block_params = attention_params + ff_params + layernorm_params
+    total_transformer_params = per_block_params * n_layers
+    
+    # Final components
+    final_layernorm = d_model + d_model  # weight + bias
+    # Output projection shares weights with token embedding (weight tying), so no additional params
+    output_projection = 0  # Weight tying means no additional parameters
+    final_params = final_layernorm + output_projection
+    
+    total_params = embedding_params + total_transformer_params + final_params
+    
+    return {
+        'embedding_params': embedding_params,
+        'transformer_params': total_transformer_params,
+        'final_params': final_params,
+        'total_params': total_params,
+        'per_block_params': per_block_params
+    }
+
+
+def params_to_gb(total_params, dtype="float32"):
+    """Convert parameter count to GB based on data type."""
+    bytes_per_param = {
+        "float32": 4,
+        "float16": 2,
+        "bfloat16": 2,
+        "int8": 1
+    }
+    
+    bytes_total = total_params * bytes_per_param.get(dtype, 4)
+    gb = bytes_total / (1024**3)
+    return gb
