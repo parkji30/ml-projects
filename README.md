@@ -1,9 +1,3 @@
-Machine Learning is getting a computer to solve a tractable problem for you. This is typically dealing with optimization problems- neural nets are just one flavor of this. 
+This is a project done by me to recreate GPT-2 to the best of my abilities, using the TikToken dataset.
 
-There's also Bayesian opt, PDE Solving, etc. My plan for this repo is to find an interesting problem and code it up here as time goes by. 
-
-Hopefully this repo doesn't turn into garbage. I plan to make a CLI-tool that visualizes the "solving" of different benchmark functions using some techniques we see here.
-
-Otherise, you can treat this repository as working examples of various techniques I've learned over the years.
-
-
+I will attempt at recreating GPT-oss (that is << 120 B) based on the research paper OpenAI provided in future iterations.
